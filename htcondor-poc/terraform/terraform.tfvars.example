@@ -1,0 +1,11 @@
+# Copy this file to terraform.tfvars and fill in every value.
+# DO NOT commit terraform.tfvars — it contains secrets.
+
+aws_region   = "us-east-1"
+project_name = "htcondor-poc"
+
+# Windows complexity rules: 12+ chars, upper + lower + digit + symbol
+admin_password = "CHANGE_ME_Adm1n!"
+
+# Instance type (t3.medium = 2 vCPU / 4 GB RAM)
+instance_type = "t3.medium"

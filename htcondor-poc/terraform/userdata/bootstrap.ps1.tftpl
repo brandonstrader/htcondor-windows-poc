@@ -1,0 +1,8 @@
+<powershell>
+# v1 bootstrap — no-op. Instances just boot as raw Windows Server 2022 and
+# are reachable via SSM Session Manager. Later stages replace this template
+# with one that downloads a role-specific setup script from S3.
+$ErrorActionPreference = "Continue"
+$Role = "${role}"
+"$(Get-Date -f 'HH:mm:ss') v1 bootstrap: role=$Role (no-op)" | Out-File C:\Bootstrap.log -Append
+</powershell>
