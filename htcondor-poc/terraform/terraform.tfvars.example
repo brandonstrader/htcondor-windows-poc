@@ -8,6 +8,9 @@ project_name = "htcondor-poc"
 admin_password   = "CHANGE_ME_Adm1n!"
 brandon_password = "CHANGE_ME_Brand1!"
 
+# HTCondor pool shared secret (any ASCII ≥ 8 chars)
+htcondor_pool_password = "CHANGE_ME_poolpw"
+
 # AD domain names
 domain_name    = "fort.wow.dev"
 domain_netbios = "FORTWOW"

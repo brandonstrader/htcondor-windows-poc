@@ -1,39 +1,40 @@
-# Deploy — v2 AD + Staged Artifacts
+# Deploy — v3 Minimal HTCondor Install
 
-This tag adds **Active Directory** and a **script-fetching bootstrap** on
-top of the v1 infrastructure. After apply the four instances rename
-themselves, set DNS to the DC, and domain-join `fort.wow.dev` — but
-**HTCondor is not yet installed**. That comes at v3.
+This tag adds the HTCondor install itself. After apply:
 
-## What gets built on top of v1
+- **mgr** runs HTCondor as CM + CREDD and hosts the SMB share used by jobs.
+- **ws-0** runs the submit node (SCHEDD).
+- **compute-0** runs the execute node (STARTD + local CREDD cache).
+- The pool password is stored on every HTCondor node so daemon-to-daemon
+  auth works. A test job (`test-brandon.sub`) is staged on submit and
+  execute for you to try.
 
-| VM | Final hostname | State at v2 |
-|----|----------------|-------------|
-| dc | DC | AD DS installed, `fort.wow.dev` forest, OUs `HTCondorPoc/{Users,Computers}`, `brandon` domain user, DNS forwarder to AmazonDNS |
-| mgr | MGR | domain-joined, idle (no HTCondor yet) |
-| ws-0 | WS-0 | domain-joined, idle |
-| compute-0 | COMPUTE-0 | domain-joined, idle |
+The configs in this tag match the initial setup from mid-April 2026 —
+they *wire up* run_as_owner (STARTER_ALLOW_RUNAS_OWNER, CREDD_CACHE_LOCALLY,
+CREDD.COLLECTOR_HOST=127.0.0.1 on execute, etc.) but they do NOT yet
+include the fixes needed to actually *complete* a run_as_owner job. That's
+what v4 does. Submitting the test job at v3 will get to "Jobs started"
+but the job will be held by the starter with a credential-lookup error.
 
-New Terraform resources vs. v1:
+## What's new vs. v2
 
-- S3 uploads of the four role setup scripts (`scripts/dc-setup.ps1`,
-  `scripts/cm-setup.ps1`, `scripts/submit-setup.ps1`,
-  `scripts/execute-setup.ps1`).
-- Extra SSM parameters: `domain-name`, `domain-netbios`,
-  `brandon-password`, `htcondor-msi-key`.
-- `user_data` now downloads and runs the role script, and registers a
-  scheduled task so setup resumes automatically across the reboots that
-  AD promotion and domain-join each require.
+| Area | Change |
+|------|--------|
+| scripts | `cm`, `submit`, `execute` setup scripts grow stage 2: MSI download, HTCondor install, config placement, pool-password store |
+| scripts | `submit-setup.ps1` also stores `brandon@fort.wow.dev` from SYSTEM context (this is one of the things v4 fixes — it currently fails) |
+| configs | `htcondor/*.conf` uploaded to `s3://<bucket>/htcondor/` (4 files) |
+| jobs | `jobs/test-brandon.{sub,bat}` uploaded to `s3://<bucket>/jobs/` |
+| terraform | new var `htcondor_pool_password`; new SSM params `htcondor-pool-password`, `share-host` |
+| CM setup | creates SMB share `\\mgr.fort.wow.dev\share` backed by `C:\HTCondorShare` |
 
-**Estimated cost while running:** ~$0.20/hr (same as v1 — same four EC2
-instances).
+**Estimated cost while running:** ~$0.20/hr.
 
 ---
 
 ## Step 1 — Prerequisites
 
-Complete `prerequisites.md` first. At v2 you DO need the HTCondor MSI
-downloaded locally — you'll upload it in step 4 below.
+Complete `prerequisites.md` first. You need the HTCondor 23.4.0 MSI
+downloaded locally.
 
 ---
 
@@ -44,17 +45,14 @@ cd htcondor-poc/terraform
 cp terraform.tfvars.example terraform.tfvars
 ```
 
-Edit `terraform.tfvars` and fill in:
+Fill in:
 
-- `admin_password` — 12+ chars, complexity-compliant. Local Administrator
-  password on every VM AND the AD Administrator password after DC
-  promotion.
-- `brandon_password` — 12+ chars, complexity-compliant. Password for the
-  `brandon` domain user (a regular, non-admin user).
-- `domain_name` / `domain_netbios` — defaults (`fort.wow.dev` / `FORTWOW`)
-  are fine unless you want to change them.
-- `htcondor_msi_s3_key` — S3 key where you'll upload the MSI. Default
-  `installers/condor-23.4.0-Windows-x64.msi`.
+- `admin_password` — local Administrator / AD Administrator password
+- `brandon_password` — password for the `brandon` domain user
+- `htcondor_pool_password` — HTCondor shared secret (≥8 chars, any ASCII)
+- `domain_name`, `domain_netbios` — defaults fine
+- `htcondor_msi_s3_key` — default fine if your MSI will be at
+  `installers/condor-23.4.0-Windows-x64.msi`
 
 ---
 
@@ -65,18 +63,13 @@ terraform init
 terraform apply
 ```
 
-Terraform creates everything from v1 plus the new S3 script uploads and
-SSM parameters. The instances boot, run the `v2` bootstrap, download
-their role script from S3, and begin the rename → domain-join dance.
-
-**Wall time for Terraform:** ~5 minutes.
+**Wall time:** ~5 minutes.
 
 ---
 
 ## Step 4 — Upload the HTCondor MSI
 
-Even though v2 doesn't install HTCondor, we stage the MSI now so v3 can
-find it. Uploading it now also confirms your S3 path is correct.
+Upload your local MSI to the S3 key that matches `htcondor_msi_s3_key`:
 
 ```bash
 aws s3 cp /path/to/condor-23.4.0-Windows-x64.msi \
@@ -84,38 +77,63 @@ aws s3 cp /path/to/condor-23.4.0-Windows-x64.msi \
   --region us-east-1
 ```
 
-Verify:
-
-```bash
-aws s3 ls s3://$(terraform output -raw s3_bucket)/installers/
-```
+The setup scripts retry the MSI download for up to 10 minutes, so you can
+upload before or shortly after `terraform apply` finishes — whichever is
+more convenient.
 
 ---
 
-## Step 5 — Wait for DC promotion + domain joins
+## Step 5 — Wait for setup to complete
 
-The DC needs ~15 minutes to rename, install AD DS, promote the forest,
-and reboot twice. The other three nodes block on the DC's LDAP port
-before domain-joining, then reboot and sit idle.
+Expected timings, serial:
 
-Watch progress via SSM:
+| Node | Completes in |
+|------|--------------|
+| DC | ~15 min (AD install + forest promotion + 2 reboots) |
+| mgr, ws-0, compute-0 | ~25 min after DC is done (domain join + MSI install) |
+
+Watch any node via SSM:
 
 ```bash
-aws ssm start-session --target $(terraform output -raw instance_ids | jq -r .dc) --region us-east-1
+aws ssm start-session --target $(terraform output -raw instance_ids | jq -r .cm) --region us-east-1
 ```
 
 ```powershell
-Get-Content C:\HTCondorSetup.log -Tail 50
-Test-Path C:\SetupComplete.txt    # True when DC is done
+Get-Content C:\HTCondorSetup.log -Tail 80
+Test-Path C:\SetupComplete.txt   # True when done
 ```
 
-Once the DC shows complete, the other three will finish their joins
-within another ~5 minutes. Check each:
+Once all four `SetupComplete.txt` markers exist, verify the pool from mgr:
 
 ```powershell
-(Get-WmiObject Win32_ComputerSystem).Domain   # should show fort.wow.dev
-Test-Path C:\SetupComplete.txt                # True when v2 work is done
+& 'C:\condor\bin\condor_status.exe' -any
 ```
+
+You should see entries for the collector, negotiator, schedd (ws-0),
+startd (compute-0), and two credd records (mgr's and compute-0's local).
+
+---
+
+## Step 6 — Try the test job (expected to NOT complete at v3)
+
+On ws-0 (submit node):
+
+```bash
+aws ssm start-session --target $(terraform output -raw instance_ids | jq -r .submit) --region us-east-1
+```
+
+```powershell
+runas /user:FORTWOW\brandon cmd.exe
+# Inside the runas shell:
+cd C:\HTCondorConfig
+C:\condor\bin\condor_submit.exe test-brandon.sub
+C:\condor\bin\condor_q.exe
+```
+
+At v3 the job will be submitted but will end up **held** by the starter
+with a message like `Could not locate valid credential` or
+`TARGET.LocalCredd did not match`. That's exactly what v4 fixes — see
+its DEPLOY.md and `POC-REPORT.md` for the six root causes.
 
 ---
 
@@ -125,14 +143,9 @@ Test-Path C:\SetupComplete.txt                # True when v2 work is done
 terraform destroy
 ```
 
-`force_destroy = true` on the artifacts bucket lets Terraform empty it
-(including the MSI you uploaded) before deleting.
-
 ---
 
 ## What's next
 
-v3-minimal-install installs HTCondor with the default pool / CM / submit /
-execute layout. The configs it uses are intentionally minimal — no
-LocalCredd, no CREDD_PORT override, no run_as_owner yet. v4 layers on
-the fixes that make run_as_owner actually work.
+v4-run-as-owner-fixes bakes in the six fixes that make the held job
+complete successfully and produce `S:\brandon-test.txt`.

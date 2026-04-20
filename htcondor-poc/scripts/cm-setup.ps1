@@ -53,6 +53,45 @@ function Wait-ForPort {
     return $false
 }
 
+function Get-S3File {
+    param([string]$BucketName, [string]$Key, [string]$LocalPath)
+    Import-Module AWSPowerShell -ErrorAction Stop
+    Read-S3Object -BucketName $BucketName -Key $Key -File $LocalPath -Region $Region -ErrorAction Stop | Out-Null
+    Log "Downloaded s3://$BucketName/$Key -> $LocalPath"
+}
+
+function Get-S3Folder {
+    param([string]$BucketName, [string]$KeyPrefix, [string]$LocalDir)
+    Import-Module AWSPowerShell -ErrorAction Stop
+    $objects = Get-S3Object -BucketName $BucketName -KeyPrefix $KeyPrefix -Region $Region
+    foreach ($obj in $objects) {
+        if ($obj.Key -match '/$') { continue }
+        $fileName = Split-Path $obj.Key -Leaf
+        $dest = Join-Path $LocalDir $fileName
+        Read-S3Object -BucketName $BucketName -Key $obj.Key -File $dest -Region $Region | Out-Null
+        Log "Downloaded: $($obj.Key)"
+    }
+}
+
+function Install-HTCondor {
+    param([string]$msiPath, [string]$condorHost, [string]$isNewPool)
+    Log "Installing HTCondor from $msiPath ..."
+    $logPath = "C:\condor-install.log"
+    $proc = Start-Process msiexec -ArgumentList @(
+        "/i", $msiPath, "/quiet", "/norestart",
+        "CONDORHOST=$condorHost", "NEWPOOL=$isNewPool", "RUNJOBS=ALWAYS",
+        "TARGETDIR=C:\condor\",
+        "/l*v", $logPath
+    ) -Wait -PassThru
+    Log "MSI exit code: $($proc.ExitCode)"
+    $env:PATH = [System.Environment]::GetEnvironmentVariable("PATH", "Machine") + ";" + $env:PATH
+    if ($proc.ExitCode -notin @(0,3010)) {
+        Log "MSI failed. See $logPath" "ERROR"
+        return $false
+    }
+    return $true
+}
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 $stage = Get-Stage
 Log "=== CM setup starting at stage $stage ==="
@@ -113,18 +152,78 @@ switch ($stage) {
         Start-Sleep 3; Restart-Computer -Force; Start-Sleep 60
     }
 
-    # ── Stage 2: done ────────────────────────────────────────────────────────
-    # At v2 the CM is fully domain-joined and idle. HTCondor install + CM/CREDD
-    # configuration come in at v3.
+    # ── Stage 2: install HTCondor, configure as CM+CREDD, create SMB share ──
     2 {
-        Log "Stage 2: domain-join complete; CM is idle at v2 (no HTCondor yet)."
+        Log "Stage 2: Install and configure HTCondor (CM + CREDD) + create SMB share"
+
+        $bucket = Get-SsmParam "s3-bucket"
+        $msiKey = Get-SsmParam "htcondor-msi-key"
+        $poolPw = Get-SsmParam "htcondor-pool-password" -Secure
+        $domain = Get-SsmParam "domain-name"
+        if (-not $bucket) { $bucket = $Bucket }
+        if (-not $msiKey) { $msiKey = "installers/condor-23.4.0-Windows-x64.msi" }
+        if (-not $domain) { $domain = "fort.wow.dev" }
+
+        # Create SMB share used by ws-0/compute-0 as S:
+        Log "Creating SMB share C:\HTCondorShare -> \\mgr.$domain\share"
+        New-Item -ItemType Directory -Path "C:\HTCondorShare" -Force | Out-Null
+        $acl = Get-Acl "C:\HTCondorShare"
+        $rule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            "Everyone", "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow")
+        $acl.SetAccessRule($rule)
+        Set-Acl "C:\HTCondorShare" $acl
+        if (-not (Get-SmbShare -Name "share" -ErrorAction SilentlyContinue)) {
+            New-SmbShare -Name "share" -Path "C:\HTCondorShare" -FullAccess "Everyone"
+            Log "SMB share 'share' created."
+        } else {
+            Log "SMB share 'share' already exists."
+        }
+
+        # Download HTCondor MSI from S3
+        $msiLocal = "C:\condor-install.msi"
+        $ok = $false
+        for ($i = 1; $i -le 10; $i++) {
+            try {
+                Get-S3File $bucket $msiKey $msiLocal
+                if (Test-Path $msiLocal) { $ok = $true; break }
+            } catch { Log "MSI download attempt $i failed: $_" "WARN" }
+            Log "MSI not yet in S3 (attempt $i/10) — waiting 60s"
+            Start-Sleep 60
+        }
+        if (-not $ok) { Log "HTCondor MSI not found in S3 after 10 attempts" "ERROR"; exit 1 }
+
+        if (-not (Install-HTCondor $msiLocal "mgr.$domain" "N")) { exit 1 }
+        Start-Sleep 15
+
+        # Download HTCondor config files
+        $configDir = "C:\ProgramData\HTCondor\config.d"
+        New-Item -ItemType Directory -Path $configDir -Force | Out-Null
+        Log "Downloading HTCondor config files from S3..."
+        Get-S3Folder $bucket "htcondor/" $configDir
+
+        Copy-Item "$configDir\01-cm.conf" "$configDir\01-role.conf" -Force
+
+        # Restart HTCondor to pick up config
+        Log "Restarting HTCondor service..."
+        Stop-Service condor -Force -ErrorAction SilentlyContinue; Start-Sleep 5
+        Start-Service condor; Start-Sleep 15
+
+        # Store pool password in credd
+        Log "Storing HTCondor pool password..."
+        & condor_store_cred add -c -p $poolPw 2>&1 | ForEach-Object { Log $_ }
+
+        Log "Running condor_reconfig..."
+        & condor_reconfig 2>&1 | ForEach-Object { Log $_ }
+        Start-Sleep 10
+
+        Log "Daemon list:"
+        & condor_status -any 2>&1 | ForEach-Object { Log $_ }
+
         Set-Stage 99
         Unregister-ScheduledTask -TaskName "HTCondorSetup" -Confirm:$false -ErrorAction SilentlyContinue
-        "CM v2 setup complete $(Get-Date)" | Set-Content "C:\SetupComplete.txt"
-        Log "=== CM setup COMPLETE (v2) ==="
+        "CM setup complete $(Get-Date)" | Set-Content "C:\SetupComplete.txt"
+        Log "=== CM setup COMPLETE ==="
     }
 
-    default {
-        Log "Stage ${stage}: nothing to do."
-    }
+    default { Log "Stage ${stage}: nothing to do." }
 }

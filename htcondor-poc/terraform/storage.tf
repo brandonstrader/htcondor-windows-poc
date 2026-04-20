@@ -63,10 +63,41 @@ resource "aws_s3_object" "script_execute" {
   etag   = filemd5("${path.module}/../scripts/execute-setup.ps1")
 }
 
+# HTCondor config files — consumed by cm/submit/execute setup scripts at
+# stage 2 (install). All four are uploaded together; each node picks the
+# role-appropriate one as its 01-role.conf after download.
+locals {
+  htcondor_configs = toset([
+    "00-common.conf",
+    "01-cm.conf",
+    "02-execute.conf",
+    "03-submit.conf",
+  ])
+  job_files = toset([
+    "test-brandon.bat",
+    "test-brandon.sub",
+  ])
+}
+
+resource "aws_s3_object" "htcondor_config" {
+  for_each = local.htcondor_configs
+  bucket   = aws_s3_bucket.artifacts.id
+  key      = "htcondor/${each.value}"
+  source   = "${path.module}/../htcondor/${each.value}"
+  etag     = filemd5("${path.module}/../htcondor/${each.value}")
+}
+
+resource "aws_s3_object" "job_file" {
+  for_each = local.job_files
+  bucket   = aws_s3_bucket.artifacts.id
+  key      = "jobs/${each.value}"
+  source   = "${path.module}/../jobs/${each.value}"
+  etag     = filemd5("${path.module}/../jobs/${each.value}")
+}
+
 # ── SSM Parameter Store ──────────────────────────────────────────────────────
-# At v2 we publish AD + artifact-location params so setup scripts can do
-# domain join and locate the MSI. HTCondor-specific params (pool password)
-# come in at v3 when we actually install.
+# At v3 we add HTCondor-specific params (pool password, SMB share host) so
+# setup scripts can install + configure the pool.
 
 resource "aws_ssm_parameter" "admin_password" {
   name  = "${local.ssm_prefix}/admin-password"
@@ -104,8 +135,20 @@ resource "aws_ssm_parameter" "htcondor_msi_key" {
   value = var.htcondor_msi_s3_key
 }
 
+resource "aws_ssm_parameter" "htcondor_pool_password" {
+  name  = "${local.ssm_prefix}/htcondor-pool-password"
+  type  = "SecureString"
+  value = var.htcondor_pool_password
+}
+
 resource "aws_ssm_parameter" "s3_bucket" {
   name  = "${local.ssm_prefix}/s3-bucket"
   type  = "String"
   value = aws_s3_bucket.artifacts.id
+}
+
+resource "aws_ssm_parameter" "share_host" {
+  name  = "${local.ssm_prefix}/share-host"
+  type  = "String"
+  value = "mgr.${var.domain_name}"
 }

@@ -62,6 +62,20 @@ variable "htcondor_msi_s3_key" {
   default     = "installers/condor-23.4.0-Windows-x64.msi"
 }
 
+variable "htcondor_pool_password" {
+  description = <<-EOF
+    Shared secret used for HTCondor's PASSWORD authentication between
+    daemons. Any ASCII string ≥ 8 chars. Stored on every node via
+    `condor_store_cred add -c` during setup.
+  EOF
+  type      = string
+  sensitive = true
+  validation {
+    condition     = length(var.htcondor_pool_password) >= 8
+    error_message = "htcondor_pool_password must be at least 8 characters."
+  }
+}
+
 variable "instance_type" {
   description = "EC2 instance type for all nodes"
   type        = string
