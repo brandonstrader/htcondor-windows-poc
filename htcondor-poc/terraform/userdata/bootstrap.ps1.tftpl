@@ -1,0 +1,46 @@
+<powershell>
+$ErrorActionPreference = "Continue"
+$Role      = "${role}"
+$Bucket    = "${bucket}"
+$Region    = "${region}"
+$SsmPrefix = "${ssm_prefix}"
+$SetupScript = "C:\setup-$Role.ps1"
+$LogFile     = "C:\Bootstrap.log"
+
+function Log { param([string]$m) "$(Get-Date -f 'HH:mm:ss') $m" | Tee-Object $LogFile -Append }
+
+Log "=== Bootstrap starting: role=$Role ==="
+
+# Use Amazon DNS initially so we can reach S3 and SSM before AD is configured
+$nic = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' -and $_.InterfaceDescription -notmatch 'Loopback' } | Select-Object -First 1
+Set-DnsClientServerAddress -InterfaceIndex $nic.ifIndex -ServerAddresses "169.254.169.253" -ErrorAction SilentlyContinue
+
+# Download role-specific setup script from S3 using AWSPowerShell (no AWS CLI needed)
+Log "Downloading s3://$Bucket/scripts/$Role-setup.ps1"
+$ok = $false
+for ($i = 1; $i -le 5; $i++) {
+    try {
+        Import-Module AWSPowerShell -ErrorAction Stop
+        Read-S3Object -BucketName $Bucket -Key "scripts/$Role-setup.ps1" -File $SetupScript -Region $Region -ErrorAction Stop | Out-Null
+        if (Test-Path $SetupScript) { $ok = $true; break }
+    } catch { Log "Attempt $i failed: $_" }
+    if ($i -lt 5) { Start-Sleep 30 }
+}
+if (-not $ok) { Log "FATAL: could not download setup script"; exit 1 }
+
+# Register a scheduled task so setup continues automatically after each reboot
+Register-ScheduledTask -Force -TaskName "HTCondorSetup" -Action (
+    New-ScheduledTaskAction -Execute "PowerShell.exe" -Argument "-NonInteractive -ExecutionPolicy Bypass -File `"$SetupScript`" -Bucket `"$Bucket`" -Region `"$Region`" -SsmPrefix `"$SsmPrefix`""
+) -Trigger (
+    New-ScheduledTaskTrigger -AtStartup
+) -Principal (
+    New-ScheduledTaskPrincipal -UserId "SYSTEM" -RunLevel Highest
+) -Settings (
+    New-ScheduledTaskSettingsSet -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 4)
+) 2>&1 | ForEach-Object { Log $_ }
+
+Log "Launching setup script asynchronously..."
+Start-Process powershell.exe -ArgumentList "-NonInteractive -ExecutionPolicy Bypass -File `"$SetupScript`" -Bucket `"$Bucket`" -Region `"$Region`" -SsmPrefix `"$SsmPrefix`"" -WindowStyle Hidden
+
+Log "Bootstrap complete. Setup running in background. Check C:\HTCondorSetup.log for progress."
+</powershell>

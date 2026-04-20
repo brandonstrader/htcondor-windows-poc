@@ -1,0 +1,13 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(aws ssm *)",
+      "Bash(pip3 install *)",
+      "Bash(python3 *)",
+      "Bash(terraform apply *)",
+      "Bash(aws s3 cp *)",
+      "Bash(*)"
+    ]
+  },
+  "autoCompact": true
+}

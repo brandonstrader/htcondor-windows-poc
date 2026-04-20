@@ -1,0 +1,25 @@
+# Copy this file to terraform.tfvars and fill in every value.
+# DO NOT commit terraform.tfvars to source control — it contains secrets.
+
+aws_region   = "us-east-1"
+project_name = "htcondor-poc"
+
+# Active Directory
+domain_name    = "fort.wow.dev"
+domain_netbios = "FORTWOW"
+
+# Windows complexity rules: 12+ chars, upper + lower + digit + symbol
+admin_password  = "CHANGE_ME_Adm1n!"
+
+# HTCondor pool shared secret (same on all nodes, 8+ chars)
+htcondor_pool_password = "CHANGE_ME_Pool#Secret1"
+
+# AD user 'brandon' who submits the test job (12+ chars)
+brandon_password = "CHANGE_ME_Brandon1!"
+
+# S3 key where you upload the HTCondor 23.4.0 MSI (see DEPLOY.md step 3)
+# Default value matches the expected upload path — only change if needed.
+htcondor_msi_s3_key = "installers/condor-23.4.0-Windows-x64.msi"
+
+# Instance type (t3.medium = 2 vCPU / 4 GB RAM, sufficient for testing)
+instance_type = "t3.medium"
