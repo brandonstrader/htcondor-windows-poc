@@ -142,6 +142,21 @@ create one manually.
 
 ---
 
+## 7. Download the HTCondor 23.4.0 Windows MSI
+
+Starting at v2 the setup scripts expect the HTCondor Windows installer to
+be available in the S3 artifacts bucket. You supply it yourself — it is
+not redistributed through this repo.
+
+1. Go to https://htcondor.org/htcondor/download/
+2. Select version **23.4.0**, platform **Windows**, architecture **x86_64**
+3. Download the `.msi` file to your local machine
+
+Keep the downloaded file somewhere convenient. You'll upload it to S3 in
+**DEPLOY.md step 4** after `terraform apply` creates the bucket.
+
+---
+
 ## Checklist
 
 - [ ] IAM user `terraform-htcondor-poc` created with access keys
@@ -149,7 +164,6 @@ create one manually.
 - [ ] AWS CLI v2 installed
 - [ ] Session Manager plugin installed; `session-manager-plugin --version` works
 - [ ] Terraform ≥ 1.5.0 installed; `terraform version` works
-
-At v1 you do NOT need the HTCondor MSI yet — it comes in at v2.
+- [ ] HTCondor 23.4.0 Windows x64 MSI downloaded to local machine
 
 Once all boxes are checked, proceed to **DEPLOY.md**.

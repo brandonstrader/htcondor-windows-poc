@@ -5,7 +5,16 @@ aws_region   = "us-east-1"
 project_name = "htcondor-poc"
 
 # Windows complexity rules: 12+ chars, upper + lower + digit + symbol
-admin_password = "CHANGE_ME_Adm1n!"
+admin_password   = "CHANGE_ME_Adm1n!"
+brandon_password = "CHANGE_ME_Brand1!"
+
+# AD domain names
+domain_name    = "fort.wow.dev"
+domain_netbios = "FORTWOW"
+
+# Where later stages expect to find the HTCondor MSI in S3. You upload
+# the MSI to this key after `terraform apply` — see DEPLOY.md.
+htcondor_msi_s3_key = "installers/condor-23.4.0-Windows-x64.msi"
 
 # Instance type (t3.medium = 2 vCPU / 4 GB RAM)
 instance_type = "t3.medium"
