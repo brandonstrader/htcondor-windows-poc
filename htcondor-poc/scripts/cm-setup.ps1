@@ -92,6 +92,93 @@ function Install-HTCondor {
     return $true
 }
 
+function Get-UserSid {
+    param([string]$DomainNetbios, [string]$SamAccount)
+    try {
+        $acct = New-Object System.Security.Principal.NTAccount($DomainNetbios, $SamAccount)
+        return $acct.Translate([System.Security.Principal.SecurityIdentifier]).Value
+    } catch {
+        Log "Get-UserSid ${DomainNetbios}\${SamAccount} failed: $_" "WARN"
+        return $null
+    }
+}
+
+function Grant-SeBatchLogonRight {
+    param([string]$Sid)
+    $inf = "$env:TEMP\sec.inf"; $sdb = "$env:TEMP\sec.sdb"
+    Remove-Item $inf,$sdb -Force -ErrorAction SilentlyContinue
+    & secedit /export /cfg $inf /areas USER_RIGHTS | Out-Null
+    $hit = $false
+    $out = foreach ($line in (Get-Content $inf)) {
+        if ($line -match '^SeBatchLogonRight\s*=') {
+            $hit = $true
+            if ($line -notmatch [regex]::Escape($Sid)) { "$line,*$Sid" } else { $line }
+        } else { $line }
+    }
+    if (-not $hit) { $out += "SeBatchLogonRight = *$Sid" }
+    $out | Set-Content $inf
+    & secedit /import /cfg $inf /db $sdb | Out-Null
+    & secedit /configure /db $sdb /areas USER_RIGHTS | Out-Null
+    Remove-Item $inf,$sdb -Force -ErrorAction SilentlyContinue
+    Log "SeBatchLogonRight granted to $Sid"
+}
+
+function Grant-CondorReadToUsers {
+    & icacls 'C:\condor\condor_config' /grant 'BUILTIN\Users:(R)' 2>&1 | Out-Null
+    & icacls 'C:\ProgramData\HTCondor\config.d' /grant 'BUILTIN\Users:(R)' /T 2>&1 | Out-Null
+    Log "Granted BUILTIN\Users:(R) on condor_config + config.d"
+}
+
+function Store-CredAsUser {
+    # HTCondor's store_cred_handler requires requesting_user base-name ==
+    # target_user base-name. Admin rights don't bypass this, so we register a
+    # scheduled task that runs AS the target user and invokes condor_store_cred.
+    # Result is captured via a file in C:\Users\Public since SSM sees only task
+    # exit codes, not stdout.
+    param(
+        [string]$UserUpn,
+        [string]$Password,
+        [string[]]$TargetForms,
+        [string]$CreddSinful
+    )
+    $resultFile = 'C:\Users\Public\cred-store-result.txt'
+    $scriptFile = 'C:\CredStoreAsUser.ps1'
+    Remove-Item $resultFile -Force -ErrorAction SilentlyContinue
+
+    $pwLiteral = "'" + ($Password -replace "'", "''") + "'"
+    $storeLines = ($TargetForms | ForEach-Object {
+        "`"-- $_ --`" | Add-Content `$result; (& condor_store_cred add -u '$_' -p $pwLiteral 2>&1 | Out-String) | Add-Content `$result"
+    }) -join "`r`n"
+
+    $body = @"
+`$ErrorActionPreference = 'Continue'
+`$env:CONDOR_CONFIG       = 'C:\condor\condor_config'
+`$env:PATH                = 'C:\condor\bin;' + `$env:PATH
+`$env:_CONDOR_CREDD_HOST  = '$CreddSinful'
+`$result = '$resultFile'
+'run as ' + `$env:USERNAME + ' @ ' + (Get-Date) | Set-Content `$result
+$storeLines
+"@
+    $body | Set-Content $scriptFile -Encoding ASCII
+    & icacls $scriptFile /grant 'BUILTIN\Users:(R)' | Out-Null
+
+    $taskName = "HTCondorCredStore"
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+    $action  = New-ScheduledTaskAction  -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -File $scriptFile"
+    $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(15)
+    Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
+        -User $UserUpn -Password $Password -RunLevel Highest -Force | Out-Null
+    Log "Scheduled cred-store task as $UserUpn"
+
+    for ($i = 0; $i -lt 60; $i++) {
+        Start-Sleep 3
+        $info = Get-ScheduledTaskInfo -TaskName $taskName -ErrorAction SilentlyContinue
+        if ($info -and $info.LastRunTime -gt (Get-Date).AddMinutes(-5) -and $info.LastTaskResult -ne 267045) { break }
+    }
+    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+    if (Test-Path $resultFile) { Get-Content $resultFile | ForEach-Object { Log $_ } }
+}
+
 # ── Main ─────────────────────────────────────────────────────────────────────
 $stage = Get-Stage
 Log "=== CM setup starting at stage $stage ==="
@@ -156,13 +243,16 @@ switch ($stage) {
     2 {
         Log "Stage 2: Install and configure HTCondor (CM + CREDD) + create SMB share"
 
-        $bucket = Get-SsmParam "s3-bucket"
-        $msiKey = Get-SsmParam "htcondor-msi-key"
-        $poolPw = Get-SsmParam "htcondor-pool-password" -Secure
-        $domain = Get-SsmParam "domain-name"
-        if (-not $bucket) { $bucket = $Bucket }
-        if (-not $msiKey) { $msiKey = "installers/condor-23.4.0-Windows-x64.msi" }
-        if (-not $domain) { $domain = "fort.wow.dev" }
+        $bucket    = Get-SsmParam "s3-bucket"
+        $msiKey    = Get-SsmParam "htcondor-msi-key"
+        $poolPw    = Get-SsmParam "htcondor-pool-password" -Secure
+        $brandonPw = Get-SsmParam "brandon-password" -Secure
+        $domain    = Get-SsmParam "domain-name"
+        $netbios   = Get-SsmParam "domain-netbios"
+        if (-not $bucket)  { $bucket  = $Bucket }
+        if (-not $msiKey)  { $msiKey  = "installers/condor-23.4.0-Windows-x64.msi" }
+        if (-not $domain)  { $domain  = "fort.wow.dev" }
+        if (-not $netbios) { $netbios = "FORTWOW" }
 
         # Create SMB share used by ws-0/compute-0 as S:
         Log "Creating SMB share C:\HTCondorShare -> \\mgr.$domain\share"
@@ -211,6 +301,27 @@ switch ($stage) {
         # Store pool password in credd
         Log "Storing HTCondor pool password..."
         & condor_store_cred add -c -p $poolPw 2>&1 | ForEach-Object { Log $_ }
+
+        # Grant access + SeBatchLogonRight to brandon for self-store pattern.
+        Grant-CondorReadToUsers
+        $brandonSid = Get-UserSid $netbios 'brandon'
+        if ($brandonSid) { Grant-SeBatchLogonRight $brandonSid }
+
+        # Store brandon's credential on THIS node's CREDD under both NetBIOS and
+        # DNS forms. condor_submit on WS-0 identifies the submitter as
+        # brandon@FORTWOW (NetBIOS), so that form MUST be present; the DNS form
+        # brandon@fort.wow.dev is kept for tools that look up by UID_DOMAIN.
+        # HTCondor's store_cred_handler rejects cross-user stores, so the
+        # scheduled task runs as brandon.
+        $cmSinful = "<127.0.0.1:9620?addrs=127.0.0.1-9620&alias=MGR.$domain>"
+        if ($brandonPw) {
+            Store-CredAsUser -UserUpn "brandon@$domain" `
+                             -Password $brandonPw `
+                             -TargetForms @("brandon@$netbios","brandon@$domain") `
+                             -CreddSinful $cmSinful
+        } else {
+            Log "brandon-password SSM parameter not set — skipping cred store" "WARN"
+        }
 
         Log "Running condor_reconfig..."
         & condor_reconfig 2>&1 | ForEach-Object { Log $_ }

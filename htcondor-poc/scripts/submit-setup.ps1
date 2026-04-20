@@ -125,7 +125,6 @@ switch ($stage) {
         $msiKey    = Get-SsmParam "htcondor-msi-key";        if (-not $msiKey)    { $msiKey    = "installers/condor-23.4.0-Windows-x64.msi" }
         $domain    = Get-SsmParam "domain-name";             if (-not $domain)    { $domain    = "fort.wow.dev" }
         $poolPw    = Get-SsmParam "htcondor-pool-password" -Secure
-        $brandonPw = Get-SsmParam "brandon-password" -Secure
         $shareHost = Get-SsmParam "share-host";              if (-not $shareHost) { $shareHost = "mgr.$domain" }
 
         $msiLocal = "C:\condor-install.msi"
@@ -161,13 +160,17 @@ switch ($stage) {
         Stop-Service condor -Force -ErrorAction SilentlyContinue; Start-Sleep 5
         Start-Service condor; Start-Sleep 15
 
-        # Store pool password
+        # Store pool password — needed for this node's SCHEDD to authenticate as
+        # condor_pool to the CM's collector/negotiator.
         Log "Storing pool password..."
         & condor_store_cred add -c -p $poolPw 2>&1 | ForEach-Object { Log $_ }
 
-        # Store brandon's user password so run_as_owner works
-        Log "Storing brandon's user password in credd..."
-        & condor_store_cred add -u "brandon@$domain" -p $brandonPw 2>&1 | ForEach-Object { Log $_ }
+        # NOTE: brandon's user credential is NOT stored here. Submit nodes only
+        # need the pool password; the STARTER on the execute node fetches the
+        # user credential from its local CREDD (populated by execute-setup.ps1).
+        # Attempting to store brandon's cred from SYSTEM context here would fail
+        # the self-store check in store_cred_handler (authenticated user would be
+        # WS-0$ or ANONYMOUS, not brandon).
 
         & condor_reconfig 2>&1 | ForEach-Object { Log $_ }
         Start-Sleep 10

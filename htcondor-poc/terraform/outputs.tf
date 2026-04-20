@@ -19,8 +19,13 @@ output "private_ips" {
 }
 
 output "s3_bucket" {
-  description = "S3 artifacts bucket name (used by later stages to stage installers)"
+  description = "S3 artifacts bucket name — upload the HTCondor MSI here"
   value       = aws_s3_bucket.artifacts.id
+}
+
+output "share_unc" {
+  description = "SMB share UNC path on CM node"
+  value       = "\\\\mgr.${var.domain_name}\\share"
 }
 
 output "ssm_connect_commands" {
@@ -30,6 +35,16 @@ output "ssm_connect_commands" {
     cm      = "aws ssm start-session --target ${aws_instance.cm.id}      --region ${var.aws_region}"
     submit  = "aws ssm start-session --target ${aws_instance.submit.id}  --region ${var.aws_region}"
     execute = "aws ssm start-session --target ${aws_instance.execute.id} --region ${var.aws_region}"
+  }
+}
+
+output "rdp_tunnel_commands" {
+  description = "Port-forward RDP (3389) to localhost:13389 via SSM (optional)"
+  value = {
+    dc      = "aws ssm start-session --target ${aws_instance.dc.id}      --region ${var.aws_region} --document-name AWS-StartPortForwardingSession --parameters '{\"portNumber\":[\"3389\"],\"localPortNumber\":[\"13389\"]}'"
+    cm      = "aws ssm start-session --target ${aws_instance.cm.id}      --region ${var.aws_region} --document-name AWS-StartPortForwardingSession --parameters '{\"portNumber\":[\"3389\"],\"localPortNumber\":[\"13390\"]}'"
+    submit  = "aws ssm start-session --target ${aws_instance.submit.id}  --region ${var.aws_region} --document-name AWS-StartPortForwardingSession --parameters '{\"portNumber\":[\"3389\"],\"localPortNumber\":[\"13391\"]}'"
+    execute = "aws ssm start-session --target ${aws_instance.execute.id} --region ${var.aws_region} --document-name AWS-StartPortForwardingSession --parameters '{\"portNumber\":[\"3389\"],\"localPortNumber\":[\"13392\"]}'"
   }
 }
 

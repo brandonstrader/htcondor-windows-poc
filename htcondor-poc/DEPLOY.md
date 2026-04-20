@@ -1,151 +1,387 @@
-# Deploy — v3 Minimal HTCondor Install
+# Deployment Guide — HTCondor 23.4.0 run_as_owner PoC
 
-This tag adds the HTCondor install itself. After apply:
+## Architecture recap
 
-- **mgr** runs HTCondor as CM + CREDD and hosts the SMB share used by jobs.
-- **ws-0** runs the submit node (SCHEDD).
-- **compute-0** runs the execute node (STARTD + local CREDD cache).
-- The pool password is stored on every HTCondor node so daemon-to-daemon
-  auth works. A test job (`test-brandon.sub`) is staged on submit and
-  execute for you to try.
+| VM | Hostname | Private IP | Role |
+|----|----------|------------|------|
+| dc | dc.fort.wow.dev | 10.0.1.10 | Active Directory DC + DNS |
+| mgr | mgr.fort.wow.dev | 10.0.1.11 | HTCondor CM + CREDD |
+| ws-0 | ws-0.fort.wow.dev | 10.0.1.12 | HTCondor submit node |
+| compute-0 | compute-0.fort.wow.dev | 10.0.1.13 | HTCondor execute node |
 
-The configs in this tag match the initial setup from mid-April 2026 —
-they *wire up* run_as_owner (STARTER_ALLOW_RUNAS_OWNER, CREDD_CACHE_LOCALLY,
-CREDD.COLLECTOR_HOST=127.0.0.1 on execute, etc.) but they do NOT yet
-include the fixes needed to actually *complete* a run_as_owner job. That's
-what v4 does. Submitting the test job at v3 will get to "Jobs started"
-but the job will be held by the starter with a credential-lookup error.
+The shared file system is an **SMB share on the CM node** (`\\mgr.fort.wow.dev\share` → `C:\HTCondorShare`). Mapped as `S:` from ws-0 and compute-0.
 
-## What's new vs. v2
+All instances are in a private subnet. Access is exclusively via **AWS Systems Manager Session Manager** — no public IPs, no open inbound ports.
 
-| Area | Change |
-|------|--------|
-| scripts | `cm`, `submit`, `execute` setup scripts grow stage 2: MSI download, HTCondor install, config placement, pool-password store |
-| scripts | `submit-setup.ps1` also stores `brandon@fort.wow.dev` from SYSTEM context (this is one of the things v4 fixes — it currently fails) |
-| configs | `htcondor/*.conf` uploaded to `s3://<bucket>/htcondor/` (4 files) |
-| jobs | `jobs/test-brandon.{sub,bat}` uploaded to `s3://<bucket>/jobs/` |
-| terraform | new var `htcondor_pool_password`; new SSM params `htcondor-pool-password`, `share-host` |
-| CM setup | creates SMB share `\\mgr.fort.wow.dev\share` backed by `C:\HTCondorShare` |
-
-**Estimated cost while running:** ~$0.20/hr.
+**Estimated cost while running:** ~$0.20/hr total.
+**Estimated cost when stopped:** ~$0.02/hr (EBS snapshots only).
 
 ---
 
-## Step 1 — Prerequisites
+## Step 1 — Clone / unzip the project
 
-Complete `prerequisites.md` first. You need the HTCondor 23.4.0 MSI
-downloaded locally.
+```
+htcondor-poc/
+├── terraform/          ← Terraform code
+├── scripts/            ← PowerShell setup scripts (uploaded to S3)
+├── htcondor/           ← HTCondor config files (uploaded to S3)
+├── jobs/               ← Test job files (uploaded to S3)
+├── prerequisites.md
+└── DEPLOY.md
+```
 
 ---
 
 ## Step 2 — Create terraform.tfvars
 
 ```bash
-cd htcondor-poc/terraform
+cd terraform
 cp terraform.tfvars.example terraform.tfvars
 ```
 
-Fill in:
+Edit `terraform.tfvars` and fill in all values. Choose strong passwords that meet
+Windows complexity rules (12+ chars, upper + lower + digit + symbol).
 
-- `admin_password` — local Administrator / AD Administrator password
-- `brandon_password` — password for the `brandon` domain user
-- `htcondor_pool_password` — HTCondor shared secret (≥8 chars, any ASCII)
-- `domain_name`, `domain_netbios` — defaults fine
-- `htcondor_msi_s3_key` — default fine if your MSI will be at
-  `installers/condor-23.4.0-Windows-x64.msi`
+> **Do not commit `terraform.tfvars` — it contains passwords in plaintext.**
+> Add it to `.gitignore`.
 
 ---
 
-## Step 3 — Deploy infrastructure
+## Step 3 — Create the S3 bucket and upload the HTCondor MSI
+
+The setup scripts on each VM download the HTCondor MSI from S3. The bucket must
+exist and the MSI must be uploaded **before** the instances try to run stage 2
+of their setup. Do this as a separate targeted apply first.
 
 ```bash
+# Inside the terraform/ directory:
 terraform init
+terraform apply -target=aws_s3_bucket.artifacts \
+                -target=aws_s3_bucket_public_access_block.artifacts \
+                -target=aws_s3_bucket_server_side_encryption_configuration.artifacts \
+                -target=random_id.bucket
+```
+
+After it completes, note the bucket name from the output:
+```bash
+terraform output s3_bucket
+# e.g.  htcondor-poc-artifacts-a1b2c3d4
+```
+
+Upload the HTCondor MSI (replace the filename with the one you downloaded):
+```bash
+aws s3 cp /path/to/condor-23.4.0-Windows-x64.msi \
+    s3://$(terraform output -raw s3_bucket)/installers/condor-23.4.0-Windows-x64.msi
+```
+
+Verify the upload:
+```bash
+aws s3 ls s3://$(terraform output -raw s3_bucket)/installers/
+```
+
+---
+
+## Step 4 — Deploy everything
+
+```bash
 terraform apply
 ```
 
-**Wall time:** ~5 minutes.
+Terraform will:
+1. Create VPC, subnets, NAT Gateway, S3 endpoint
+2. Create IAM roles, security groups
+3. Upload scripts and configs to S3
+4. Create SSM parameters for all secrets
+5. Launch all four EC2 instances
+
+Each instance then runs its setup script via a scheduled task that survives reboots. Setup chains: DC → CM (waits for DC) → ws-0 and compute-0 (wait for DC + CM).
+
+**Total wall time: ~30–40 minutes** (DC forest creation + downstream joins + HTCondor installs).
+
+When `terraform apply` finishes, note the outputs:
+```bash
+terraform output ssm_connect_commands
+terraform output share_unc
+```
 
 ---
 
-## Step 4 — Upload the HTCondor MSI
+## Step 5 — Monitor setup progress
 
-Upload your local MSI to the S3 key that matches `htcondor_msi_s3_key`:
+Each instance runs its setup script automatically. Check progress via SSM:
 
 ```bash
-aws s3 cp /path/to/condor-23.4.0-Windows-x64.msi \
-  s3://$(terraform output -raw s3_bucket)/installers/condor-23.4.0-Windows-x64.msi \
-  --region us-east-1
+# Connect to DC (substitute the actual instance ID from terraform output)
+aws ssm start-session --target <dc-instance-id> --region us-east-1
 ```
 
-The setup scripts retry the MSI download for up to 10 minutes, so you can
-upload before or shortly after `terraform apply` finishes — whichever is
-more convenient.
+Inside the SSM session (PowerShell):
+```powershell
+Get-Content C:\HTCondorSetup.log -Wait    # live tail
+Get-Content C:\SetupStage.txt             # current stage (0/1/2/99)
+Test-Path C:\SetupComplete.txt            # True when done
+```
+
+**Expected timelines after `terraform apply` completes:**
+
+| VM | Setup complete |
+|----|---------------|
+| dc | ~20 min (AD forest creation includes 1 auto-reboot) |
+| mgr | ~30 min (waits for DC, 2 reboots, HTCondor install) |
+| ws-0 | ~30 min (same) |
+| compute-0 | ~30 min (same) |
+
+All four VMs can set up in parallel once the DC is ready.
 
 ---
 
-## Step 5 — Wait for setup to complete
+## Step 6 — Verify the HTCondor pool
 
-Expected timings, serial:
-
-| Node | Completes in |
-|------|--------------|
-| DC | ~15 min (AD install + forest promotion + 2 reboots) |
-| mgr, ws-0, compute-0 | ~25 min after DC is done (domain join + MSI install) |
-
-Watch any node via SSM:
-
+Connect to the CM:
 ```bash
-aws ssm start-session --target $(terraform output -raw instance_ids | jq -r .cm) --region us-east-1
+aws ssm start-session --target <cm-instance-id> --region us-east-1
 ```
 
 ```powershell
-Get-Content C:\HTCondorSetup.log -Tail 80
-Test-Path C:\SetupComplete.txt   # True when done
+# All nodes should appear
+condor_status
+
+# CREDD must be listed for mgr
+condor_status -any | Select-String "CREDD"
+
+# LocalCredd is published from 04-localcredd.conf on the execute node
+# (generated by execute-setup.ps1; see Troubleshooting "LocalCredd = UNDEF")
+condor_status -f "%s`t" Name -f "LocalCredd=%s`n" LocalCredd
+
+# Expected:
+# slot1@COMPUTE-0.fort.wow.dev   LocalCredd=<10.0.1.11:9620?addrs=10.0.1.11-9620&alias=MGR.fort.wow.dev>
 ```
 
-Once all four `SetupComplete.txt` markers exist, verify the pool from mgr:
-
-```powershell
-& 'C:\condor\bin\condor_status.exe' -any
-```
-
-You should see entries for the collector, negotiator, schedd (ws-0),
-startd (compute-0), and two credd records (mgr's and compute-0's local).
+If `LocalCredd` shows `UNDEF` on compute-0, see the
+"LocalCredd = UNDEF" entry in the Troubleshooting section.
 
 ---
 
-## Step 6 — Try the test job (expected to NOT complete at v3)
+## Step 7 — Run the test job as brandon
 
-On ws-0 (submit node):
+### 7a. Verify brandon's credential is stored
 
-```bash
-aws ssm start-session --target $(terraform output -raw instance_ids | jq -r .submit) --region us-east-1
+`cm-setup.ps1` stores brandon's credential on the CM's CREDD and
+`execute-setup.ps1` stores it on compute-0's local CREDD — both under the
+NetBIOS (`brandon@FORTWOW`) and DNS (`brandon@fort.wow.dev`) forms. Both
+forms are required because HTCondor's schedd identifies submitters via NTSSPI
+using NetBIOS while other code paths use UID_DOMAIN (DNS).
+
+From the CM (mgr):
+```powershell
+$env:_CONDOR_CREDD_HOST = "<10.0.1.11:9620?addrs=10.0.1.11-9620&alias=MGR.fort.wow.dev>"
+condor_store_cred query -u brandon@FORTWOW        # should report "A credential is stored"
+condor_store_cred query -u brandon@fort.wow.dev   # same
 ```
 
+If either is missing, the usual cause is `SeBatchLogonRight` not being granted
+on that node yet — the scheduled task in cm-setup/execute-setup exits with
+`267011` (ERROR_TASK_NOT_RUNNING). See Troubleshooting.
+
+### 7b. Submit the job
+
+Connect to the submit node (ws-0):
+```bash
+aws ssm start-session --target <submit-instance-id> --region us-east-1
+```
+
+Inside the SSM session you are running as SYSTEM. Switch to brandon's context
+to properly exercise run_as_owner:
+
 ```powershell
+# Get brandon's password from SSM Parameter Store (admin convenience)
+$pw = aws ssm get-parameter --name "/htcondor-poc/brandon-password" `
+        --with-decryption --query Parameter.Value --output text
+
+# Launch a process as brandon
+$cred = New-Object System.Management.Automation.PSCredential(
+    "FORTWOW\brandon",
+    (ConvertTo-SecureString $pw -AsPlainText -Force)
+)
+Start-Process cmd.exe -Credential $cred -ArgumentList `
+    "/K cd C:\HTCondorConfig && condor_submit test-brandon.sub" `
+    -WorkingDirectory "C:\HTCondorConfig" -Wait
+```
+
+Or use `runas` interactively:
+```cmd
 runas /user:FORTWOW\brandon cmd.exe
-# Inside the runas shell:
+# In the new window:
 cd C:\HTCondorConfig
-C:\condor\bin\condor_submit.exe test-brandon.sub
-C:\condor\bin\condor_q.exe
+condor_submit test-brandon.sub
 ```
 
-At v3 the job will be submitted but will end up **held** by the starter
-with a message like `Could not locate valid credential` or
-`TARGET.LocalCredd did not match`. That's exactly what v4 fixes — see
-its DEPLOY.md and `POC-REPORT.md` for the six root causes.
+### 7c. Watch the job
+
+```powershell
+condor_q                          # should show job in I (idle) → R (running)
+condor_q -format "%d\n" ClusterId -format "%s\n" JobStatus
+```
+
+### 7d. Verify the result
+
+After the job completes (`condor_q` shows empty):
+
+```powershell
+# On ws-0 or compute-0 — the proof file is on the CM's SMB share:
+$host = aws ssm get-parameter --name "/htcondor-poc/share-host" --query Parameter.Value --output text
+net use S: "\\$host\share"
+Get-Content S:\brandon-test.txt
+# Expected: "Written by FORTWOW\brandon on COMPUTE-0 at ..."
+dir S:\
+```
+
+The job wrote to the CM share as `brandon` — proving impersonation worked end-to-end.
 
 ---
+
+## Troubleshooting
+
+### job goes on hold: "Could not locate valid credential for user 'brandon@FORTWOW'"
+The starter on compute-0 couldn't find brandon's credential on the LOCAL credd.
+With `CREDD_CACHE_LOCALLY=True`, the starter always checks its local credd
+first — the central CM credd is never consulted at job-start time.
+
+- Confirm the cred is stored on compute-0's local credd under the NetBIOS form:
+  ```powershell
+  $env:_CONDOR_CREDD_HOST = "<127.0.0.1:9620?addrs=127.0.0.1-9620&alias=COMPUTE-0.fort.wow.dev>"
+  condor_store_cred query -u brandon@FORTWOW
+  ```
+- Re-run the self-store if missing — see Step 7a.
+- Pool password not stored on compute-0: `condor_store_cred add -c -p <pw>` on compute-0.
+
+### LocalCredd = UNDEF on the startd
+HTCondor 23.4 on Windows does NOT auto-populate LocalCredd in the startd
+ClassAd from the collector's CREDD ad, even when the CREDD is visible in
+`condor_status -any`. `execute-setup.ps1` writes
+`C:\ProgramData\HTCondor\config.d\04-localcredd.conf` with the CM's sinful
+string, and `02-execute.conf` advertises it via `STARTD_ATTRS`.
+
+- Verify the file exists: `Get-Content C:\ProgramData\HTCondor\config.d\04-localcredd.conf`
+- Verify it's published: `condor_status -f "%s`t" Name -f "LocalCredd=%s`n" LocalCredd`
+- DAEMON_LIST must still have CREDD before STARTD so the credd is registered when the startd boots.
+- Run `condor_reconfig -all` and wait 60 seconds if you edited the config.
+
+### job stays idle — analyze shows LocalCredd requirement unmatched
+```powershell
+condor_q -better-analyze <cluster>
+# Look for: "TARGET.LocalCredd is <sinful>" unmatched
+```
+Same root cause as "LocalCredd = UNDEF" above. The submitter publishes a
+requirement for a specific LocalCredd sinful string; the startd must
+advertise it. Check `04-localcredd.conf` on every execute node.
+
+### condor_store_cred returns "DENIED" or "FAILURE_NOT_SECURE"
+HTCondor's `store_cred_handler` enforces **self-store**: the authenticated
+user's base name must equal the target user's base name. Running
+`condor_store_cred add -u brandon@fort.wow.dev ...` from an Administrator or
+SYSTEM session will ALWAYS be denied, even though those identities have
+CONFIG-level authorization.
+
+The setup scripts work around this by registering a short-lived scheduled
+task that runs AS brandon. This requires:
+- `SeBatchLogonRight` granted to brandon's SID (via `secedit /import`) — done by setup
+- Read access to `C:\condor\condor_config` and `C:\ProgramData\HTCondor\config.d` for `BUILTIN\Users` (via `icacls`) — done by setup
+- `_CONDOR_CREDD_HOST` env var set to the full sinful string of the target credd — the master's `9620 → UNREGISTERED COMMAND` shortcut doesn't apply when the client skips the collector lookup
+
+If `Get-ScheduledTaskInfo` shows `LastTaskResult = 267011` for the task, the
+user lacks `SeBatchLogonRight`. `267045` = task never ran (still pending).
+
+### condor_store_cred: "UNREGISTERED COMMAND 479"
+The client tried to send STORE_CRED to port 9618 (master's shared_port),
+which doesn't know about credd commands. Set `CREDD_PORT=9620` and
+`CREDD.USE_SHARED_PORT=False` in the credd node's config (already set in
+`01-cm.conf` and `02-execute.conf`), and set `_CONDOR_CREDD_HOST` to the
+full sinful string so the client bypasses the collector lookup.
+
+### condor_submit: "SECMAN:2010: Received 'DENIED' from server" for brandon@fortwow
+The schedd's ALLOW_WRITE list doesn't include the NetBIOS domain form.
+Confirm `00-common.conf` has `*@fortwow` alongside `*@fort.wow.dev` in
+ALLOW_WRITE, ALLOW_DAEMON, ALLOW_NEGOTIATOR, ALLOW_ADMINISTRATOR, and
+ALLOW_CONFIG. Windows NTSSPI authentication maps to the NetBIOS short name,
+NOT the DNS FQDN, so both forms are required.
+
+### job goes on hold: "Failed to initialize user_priv as (null)\brandon"
+- UID_DOMAIN is wrong — check that all nodes have `UID_DOMAIN = fort.wow.dev`
+
+### condor_store_cred fails with "FAILURE_NOT_SECURE"
+- `SEC_CONFIG_ENCRYPTION = REQUIRED` not set — confirm `00-common.conf` is loaded
+- Run `condor_config_val SEC_CONFIG_ENCRYPTION` on the node to verify
+
+### Domain join fails (Add-Computer error)
+- DC not yet ready — check `C:\SetupStage.txt` on dc (needs to be `99`)
+- DNS not pointing to DC — run on the failing node:
+  ```powershell
+  $nic = Get-NetAdapter | Where-Object { $_.Status -eq 'Up' } | Select-Object -First 1
+  Set-DnsClientServerAddress -InterfaceIndex $nic.ifIndex -ServerAddresses @("10.0.1.10","169.254.169.253")
+  ```
+  Then re-run the setup script manually.
+
+### SSM session won't open ("Target ... not connected")
+- Instance may still be booting (allow 5 min after `terraform apply`)
+- Check instance state in EC2 console
+- SSM agent must be running; it's pre-installed on the Amazon Windows 2022 AMI
+
+### How to re-run a setup stage manually
+```powershell
+# Set stage back to the one you want to re-run (e.g. stage 2)
+Set-Content C:\SetupStage.txt 2
+# Then run the script directly:
+& C:\setup-cm.ps1 -Bucket <bucket-name> -Region us-east-1
+```
+
+---
+
+## Connecting via RDP (optional)
+
+If you prefer a GUI session, use SSM port forwarding instead of opening RDP
+to the internet:
+
+```bash
+# Forwards local port 13389 → instance port 3389
+aws ssm start-session --target <instance-id> --region us-east-1 \
+    --document-name AWS-StartPortForwardingSession \
+    --parameters '{"portNumber":["3389"],"localPortNumber":["13389"]}'
+```
+
+Then open Remote Desktop to `localhost:13389`.
+Username: `Administrator` (pre-domain-join) or `FORTWOW\Administrator` (post-join).
+Password: the `admin_password` from your `terraform.tfvars`.
+
+---
+
+## Security caveats
+
+The setup scripts register a scheduled task that runs as brandon to work
+around HTCondor's `store_cred_handler` self-store check. This task is
+backed by a PowerShell script (`C:\CredStoreAsUser.ps1`) that contains
+brandon's password in cleartext, with `BUILTIN\Users:(R)` ACL so the
+scheduled-task runtime can read it. After the task finishes it is
+unregistered, but the `.ps1` file remains on disk readable to any domain
+user logged onto that host.
+
+For a production deployment this file should be removed after setup
+completes, or the credential-store flow should be performed interactively
+by brandon from an actual user session. Neither is done here because the
+point of this PoC is to validate the automated-setup path.
+
+The `C:\Users\Public\cred-store-result.txt` artifact also contains the
+raw stderr/stdout from `condor_store_cred`; its contents are read once
+and logged to `C:\HTCondorSetup.log`, but the file itself is not deleted.
 
 ## Teardown
 
+When finished testing:
 ```bash
 terraform destroy
 ```
 
----
+This destroys everything including the S3 bucket, all instances, and all
+networking. The `htcondor-poc-key.pem` file remains locally.
 
-## What's next
-
-v4-run-as-owner-fixes bakes in the six fixes that make the held job
-complete successfully and produce `S:\brandon-test.txt`.
+Estimated cost if you forget to destroy and leave it running overnight (~8 hr): ~$2.
